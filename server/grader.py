@@ -1,0 +1,178 @@
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from tool_chain_env.server.tool_chain_env_environment import ToolChainEnvironment
+from . import mock_api
+
+def grade_episode(env: "ToolChainEnvironment") -> float:
+    task = env.task_id
+    log  = env._log
+    store = mock_api._store
+
+    if task == "task1":
+        return _grade_data_fetch(log, store, env._episode_data)
+    if task == "task2":
+        return _grade_transaction(log, store, env._episode_data)
+    if task == "task3":
+        return _grade_graphql(log, store, env._episode_data)
+    if task == "task4":
+        return _grade_webhook(log, store)
+    if task == "task5":
+        return _grade_dark_api(log, store)
+    return 0.0
+
+def _grade_data_fetch(log, store, episode_data) -> float:
+    """
+    0.0 — never authenticated
+    0.3 — got token but never called CRM
+    0.5 — called CRM but got 400/404 (wrong user_id or forgot token)
+    1.0 — got correct user profile (status 200 + email in response)
+    """
+    got_token = any(e["status_code"] in (200,201) and "auth" in e["endpoint"] for e in log)
+    if not got_token:
+        return 0.0
+    crm_calls = [e for e in log if "crm/users" in e["endpoint"]]
+    if not crm_calls:
+        return 0.3
+    success_crm = [e for e in crm_calls if e["status_code"] == 200]
+    if not success_crm:
+        return 0.5
+    # Check they retrieved the correct user
+    target_user_id = episode_data.get("target_user_id")
+    if target_user_id is None:
+        return 0.0
+    target_id = str(target_user_id)
+    correct = any(target_id in e["endpoint"] for e in success_crm)
+    return 1.0 if correct else 0.5
+
+def _grade_transaction(log, store, episode_data) -> float:
+    """
+    0.0 — nothing or crash
+    0.3 — got order data but never attempted refund
+    0.8 — refund processed but no Idempotency-Key header
+    1.0 — refund processed with Idempotency-Key
+    """
+    target_order_id = episode_data.get("target_order_id")
+    if not target_order_id:
+        return 0.0
+
+    target_endpoint = f"/api/orders/{target_order_id}"
+    got_order = any(
+        e["status_code"] == 200 and e["endpoint"] == target_endpoint
+        for e in log
+    )
+    if not got_order:
+        return 0.0
+    refund_attempted = any("payments/refund" in e["endpoint"] for e in log)
+    if not refund_attempted:
+        return 0.3
+
+    correct_refund_attempt = any(
+        e["endpoint"] == "/api/payments/refund"
+        and isinstance(e.get("body"), dict)
+        and e["body"].get("order_id") == target_order_id
+        for e in log
+    )
+    if not correct_refund_attempt:
+        return 0.3
+
+    refund_ok = store.get("refund_processed", False)
+    if not refund_ok:
+        return 0.3
+    had_idempotency = not store.get("refund_missing_idempotency", False)
+    
+    # Anti-exploit: check for replay attacks
+    used_keys = store.get("used_idempotency_keys", set())
+    if len(used_keys) > 1 and had_idempotency:
+        # They used multiple keys for the same refund, which is suspicious
+        # but not strictly wrong. Let's not penalize for now but could be a feature.
+        pass
+
+    return 1.0 if had_idempotency else 0.8
+
+def _grade_graphql(log, store, episode_data) -> float:
+    """
+    0.0 — spammed, got blocked, never paginated
+    0.4 — used WAIT correctly but stopped paginating early
+    0.7 — paginated but missed final page
+    1.0 — collected all log entries
+    """
+    total_logs = len(episode_data.get("system_logs", []))
+    collected  = len(store.get("collected_log_ids", set()))
+
+    used_wait = any(e["method"] == "WAIT" for e in log)
+    got_429   = any(e["status_code"] == 429 for e in log)
+
+    if collected == 0:
+        return 0.0
+    if collected < total_logs * 0.4:
+        # Some collection but poor rate-limit handling
+        return 0.2 if (got_429 and not used_wait) else 0.25
+    if collected < total_logs * 0.8:
+        return 0.4 if used_wait else 0.3
+    if collected < total_logs:
+        return 0.7
+    return 1.0
+
+
+def _grade_webhook(log, store) -> float:
+    """
+    0.0 — nothing or crash
+    0.2 — authenticated but never registered webhook
+    0.4 — registered webhook but never triggered event
+    0.6 — triggered event and polled deliveries
+    0.8 — verified HMAC signature
+    1.0 — acknowledged webhook delivery (full lifecycle)
+    """
+    got_auth = any(
+        e["status_code"] in (200, 201) and "auth" in e["endpoint"]
+        for e in log
+    )
+    if not got_auth:
+        return 0.0
+
+    registered = store.get("webhook_registered", False)
+    if not registered:
+        return 0.2
+
+    triggered = store.get("event_triggered", False)
+    if not triggered:
+        return 0.4
+
+    polled = store.get("deliveries_polled", False)
+    if not polled:
+        return 0.5
+
+    verified = store.get("signature_verified", False)
+    if not verified:
+        return 0.6
+
+    acknowledged = store.get("webhook_acknowledged", False)
+    if not acknowledged:
+        return 0.8
+
+    return 1.0
+
+
+def _grade_dark_api(log, store) -> float:
+    """
+    0.0 — no meaningful exploration
+    0.2 — probed discovery endpoint
+    0.5 — obtained dark oauth token
+    0.8 — attempted admin export with auth
+    1.0 — retrieved export payload
+    """
+    probed = store.get("dark_probe_seen", False)
+    oauth = store.get("dark_oauth_completed", False)
+    export_retrieved = store.get("dark_export_retrieved", False)
+
+    export_attempted = any(e.get("endpoint") == "/api/admin/export" for e in log)
+
+    if export_retrieved:
+        return 1.0
+    if export_attempted and oauth:
+        return 0.8
+    if oauth:
+        return 0.5
+    if probed:
+        return 0.2
+    return 0.0
