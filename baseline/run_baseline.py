@@ -194,9 +194,20 @@ def run_heuristic_episode(task_id: str) -> float:
 
         elif task_id == "task5":
             resp_data = obs.get("response_data", {})
-            if not resp_data or not resp_data.get("hints"):
-                action = {"method": "GET", "endpoint": "/api/dark/probe", "headers": {}, "body": None}
-            elif not resp_data.get("access_token"):
+            # Task5 state machine:
+            # - start with discovery probe
+            # - exchange pkce_verifier for access token
+            # - call admin export with Bearer token
+            # Check access_token first so we don't regress to probe after OAuth.
+            if resp_data.get("access_token"):
+                dark_token = resp_data.get("access_token", "")
+                action = {
+                    "method": "GET",
+                    "endpoint": "/api/admin/export",
+                    "headers": {"Authorization": f"Bearer {dark_token}"},
+                    "body": None,
+                }
+            elif resp_data.get("pkce_verifier"):
                 pkce_verifier = resp_data.get("pkce_verifier", "")
                 action = {
                     "method": "POST",
@@ -205,13 +216,7 @@ def run_heuristic_episode(task_id: str) -> float:
                     "body": {"pkce_verifier": pkce_verifier},
                 }
             else:
-                dark_token = resp_data.get("access_token", "")
-                action = {
-                    "method": "GET",
-                    "endpoint": "/api/admin/export",
-                    "headers": {"Authorization": f"Bearer {dark_token}"},
-                    "body": None,
-                }
+                action = {"method": "GET", "endpoint": "/api/dark/probe", "headers": {}, "body": None}
 
         result = requests.post(
             f"{BASE}/step_task",
